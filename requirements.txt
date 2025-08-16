@@ -1,0 +1,4 @@
+fastapi
+python_dateutil
+starlette
+uvicorn
