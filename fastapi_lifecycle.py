@@ -227,35 +227,91 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as MiddlewareResponse
 
 
+# FastAPI middleware to automatically inject headers
+from fastapi import FastAPI, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as MiddlewareResponse
+
+
 class VersioningMiddleware(BaseHTTPMiddleware):
-    """Middleware to automatically inject versioning headers."""
+    """Middleware to automatically inject versioning headers using request scope."""
     
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         
-        # Try to find the route handler and check for versioning metadata
-        if hasattr(request.state, 'route') and hasattr(request.state.route, 'endpoint'):
-            endpoint = request.state.route.endpoint
+        # Get the route from request scope (set by FastAPI during routing)
+        route = request.scope.get("route")
+        
+        if route and hasattr(route, 'endpoint'):
+            endpoint = route.endpoint
             
-            # Check for deprecated config
-            if hasattr(endpoint, '_deprecated_config'):
-                _inject_headers(response, endpoint._deprecated_config)
-            
-            # Check for sunset config
-            if hasattr(endpoint, '_sunset_config'):
-                _inject_headers(response, endpoint._sunset_config)
-            
-            # Check for versioned config
-            if hasattr(endpoint, '_versioned_config'):
-                _inject_headers(response, endpoint._versioned_config)
+            # Check for versioning configs and inject headers
+            for config_attr in ['_deprecated_config', '_sunset_config', '_versioned_config']:
+                if hasattr(endpoint, config_attr):
+                    config = getattr(endpoint, config_attr)
+                    _inject_headers(response, config)
         
         return response
 
 
-# Convenience function to setup the middleware
-def setup_versioning(app: FastAPI):
-    """Add versioning middleware to FastAPI app."""
-    app.add_middleware(VersioningMiddleware)
+# Alternative: Dependency-based approach (more explicit)
+from fastapi import Depends
+
+def inject_lifecycle_headers(response: Response, endpoint_func: Callable = None):
+    """Dependency to inject lifecycle headers. More explicit but requires manual addition."""
+    if endpoint_func:
+        for config_attr in ['_deprecated_config', '_sunset_config', '_versioned_config']:
+            if hasattr(endpoint_func, config_attr):
+                config = getattr(endpoint_func, config_attr)
+                _inject_headers(response, config)
+
+
+# Alternative: Custom APIRoute class (most performant)
+from fastapi.routing import APIRoute
+from starlette.requests import Request
+from starlette.responses import Response as StarletteResponse
+
+class LifecycleAPIRoute(APIRoute):
+    """Custom APIRoute that automatically handles lifecycle headers."""
+    
+    def get_route_handler(self) -> Callable:
+        original_route_handler = super().get_route_handler()
+        
+        async def custom_route_handler(request: Request) -> StarletteResponse:
+            response = await original_route_handler(request)
+            
+            # Inject headers if endpoint has lifecycle configs
+            endpoint = self.endpoint
+            for config_attr in ['_deprecated_config', '_sunset_config', '_versioned_config']:
+                if hasattr(endpoint, config_attr):
+                    config = getattr(endpoint, config_attr)
+                    _inject_headers(response, config)
+            
+            return response
+        
+        return custom_route_handler
+
+
+# Convenience functions for different approaches
+def setup_versioning(app: FastAPI, method: str = "middleware"):
+    """
+    Add versioning to FastAPI app using different methods.
+    
+    Args:
+        app: FastAPI application instance
+        method: "middleware" (default), "route_class", or "manual"
+    """
+    if method == "middleware":
+        app.add_middleware(VersioningMiddleware)
+    elif method == "route_class":
+        app.router.route_class = LifecycleAPIRoute
+    else:
+        print("Using manual method - add Depends(inject_lifecycle_headers) to endpoints")
+
+
+def setup_versioning_with_route_class(app: FastAPI):
+    """Setup versioning using custom APIRoute class (most performant)."""
+    app.router.route_class = LifecycleAPIRoute
 
 
 # Example usage and testing
@@ -315,6 +371,19 @@ if __name__ == "__main__":
     async def explicit_response_endpoint(response: Response):
         response.status_code = 200
         return {"message": "Endpoint with explicit response"}
+    
+    @app.get("/test-headers")
+    @versioned({
+        'version': '1.0',
+        'deprecated_at': '2024-01-15T00:00:00Z',
+        'sunset_at': '2024-06-15T00:00:00Z',
+        'migration_url': 'https://api.example.com/docs/migration',
+        'replacement': 'GET /v2/test',
+        'reason': 'Testing header injection'
+    })
+    async def test_headers_endpoint():
+        return {"message": "Check the response headers!"}
+    
     
     if __name__ == "__main__":
         uvicorn.run(app, host="0.0.0.0", port=8000)
